@@ -1,0 +1,316 @@
+//! PatchworkMCP — Drop-in feedback tool for Rust MCP servers.
+//!
+//! Copy this file into your project and call `send_feedback()` with your
+//! MCP server router, or use the constants and helpers directly.
+//!
+//! Dependencies (add to Cargo.toml):
+//!   reqwest = { version = "0.12", features = ["json"] }
+//!   serde = { version = "1", features = ["derive"] }
+//!   serde_json = "1"
+//!   tokio = { version = "1", features = ["full"] }
+//!
+//! Configuration via environment:
+//!   PATCHWORKMCP_URL          - default: https://patchworkmcp.com
+//!   PATCHWORKMCP_API_KEY      - required API key
+//!   PATCHWORKMCP_SERVER_SLUG  - required server identifier
+//!
+//! Note: The Rust MCP ecosystem is still maturing. This file provides the
+//! feedback payload, HTTP submission, and schema constants. Wire the tool
+//! into your MCP framework's registration system as needed.
+
+use serde::{Deserialize, Serialize};
+use std::env;
+use std::sync::LazyLock;
+use std::time::Duration;
+
+// ── Constants ───────────────────────────────────────────────────────────────
+
+pub const TOOL_NAME: &str = "feedback";
+
+pub const TOOL_DESCRIPTION: &str = concat!(
+    "Report when you cannot find what you need or when available tools don't ",
+    "fully address the task. This feedback directly improves this server. ",
+    "Call this tool whenever: ",
+    "(1) you looked for a tool or resource that doesn't exist, ",
+    "(2) a tool returned incomplete or unhelpful results, ",
+    "(3) you had to work around a limitation or approximate an answer, ",
+    "(4) a new tool or parameter would have made the task easier. ",
+    "If you could not fully satisfy the user's request with the available ",
+    "tools, call this BEFORE giving your final response.",
+);
+
+// ── Types ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedbackPayload {
+    pub server_slug: String,
+    pub what_i_needed: String,
+    pub what_i_tried: String,
+    pub gap_type: String,
+    #[serde(default)]
+    pub suggestion: String,
+    #[serde(default)]
+    pub user_goal: String,
+    #[serde(default)]
+    pub resolution: String,
+    #[serde(default)]
+    pub agent_model: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub client_type: String,
+    #[serde(default)]
+    pub tools_available: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiResponse {
+    #[allow(dead_code)]
+    id: String,
+    #[allow(dead_code)]
+    status: String,
+}
+
+// ── HTTP Client Config ──────────────────────────────────────────────────────
+
+const MAX_RETRIES: u32 = 2;
+const INITIAL_BACKOFF_MS: u64 = 500; // doubles each retry
+const USER_AGENT: &str = "PatchworkMCP-Rust/1.0";
+
+/// Module-level HTTP client for connection pooling and TLS session reuse.
+/// LazyLock is stable since Rust 1.80.
+static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .user_agent(USER_AGENT)
+        .pool_max_idle_per_host(5)
+        .build()
+        .expect("Failed to build reqwest HTTP client")
+});
+
+fn is_retryable_status(code: u16) -> bool {
+    matches!(code, 429 | 500 | 502 | 503 | 504)
+}
+
+/// Prefix makes these log lines greppable in any log aggregator.
+const LOG_PREFIX: &str = "PATCHWORKMCP_UNSENT_FEEDBACK";
+
+/// Log the full payload to stderr so the hosting environment captures it.
+/// The structured JSON is greppable via LOG_PREFIX and can be replayed from
+/// whatever log aggregation the containing server uses (Heroku logs,
+/// CloudWatch, Docker stdout, etc.).
+fn log_unsent_payload(payload: &FeedbackPayload, reason: &str) {
+    let json = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
+    eprintln!("{LOG_PREFIX} reason={reason} payload={json}");
+}
+
+// ── Config ──────────────────────────────────────────────────────────────────
+
+/// Override environment variable defaults for PatchworkMCP connection.
+pub struct Options {
+    /// Override PATCHWORKMCP_URL.
+    pub patchwork_url: Option<String>,
+    /// Override PATCHWORKMCP_API_KEY.
+    pub api_key: Option<String>,
+    /// Override PATCHWORKMCP_SERVER_SLUG.
+    pub server_slug: Option<String>,
+}
+
+fn resolve_url(opts: Option<&Options>) -> String {
+    if let Some(o) = opts {
+        if let Some(ref url) = o.patchwork_url {
+            return url.clone();
+        }
+    }
+    env::var("PATCHWORKMCP_URL").unwrap_or_else(|_| "https://patchworkmcp.com".to_string())
+}
+
+fn resolve_key(opts: Option<&Options>) -> Option<String> {
+    if let Some(o) = opts {
+        if let Some(ref key) = o.api_key {
+            return if key.is_empty() { None } else { Some(key.clone()) };
+        }
+    }
+    env::var("PATCHWORKMCP_API_KEY").ok().filter(|k| !k.is_empty())
+}
+
+fn resolve_slug(opts: Option<&Options>) -> String {
+    if let Some(o) = opts {
+        if let Some(ref slug) = o.server_slug {
+            return slug.clone();
+        }
+    }
+    env::var("PATCHWORKMCP_SERVER_SLUG").unwrap_or_else(|_| "unknown".to_string())
+}
+
+// ── Submission ──────────────────────────────────────────────────────────────
+
+/// Send feedback to PatchworkMCP with retry logic.
+///
+/// Retries up to `MAX_RETRIES` times on transient failures (connection errors,
+/// 5xx, 429) with exponential backoff. Uses a module-level `reqwest::Client`
+/// for connection pooling and TLS session reuse.
+///
+/// Best-effort — returns a user-facing message regardless of success or failure.
+/// Pass `None` for opts to use environment variable defaults.
+pub async fn send_feedback(payload: &FeedbackPayload, opts: Option<&Options>) -> String {
+    let endpoint = format!("{}/api/v1/feedback/", resolve_url(opts));
+    let auth_key = resolve_key(opts);
+
+    for attempt in 0..=MAX_RETRIES {
+        let mut req = CLIENT.post(&endpoint).json(payload);
+        if let Some(ref key) = auth_key {
+            req = req.header("Authorization", format!("Bearer {key}"));
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if status == 201 {
+                    return "Thank you. Your feedback has been recorded and will be \
+                            used to improve this server's capabilities."
+                        .to_string();
+                }
+                if is_retryable_status(status) && attempt < MAX_RETRIES {
+                    eprintln!(
+                        "PatchworkMCP returned {status}, retrying ({}/{})",
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
+                    tokio::time::sleep(Duration::from_millis(
+                        INITIAL_BACKOFF_MS * 2u64.pow(attempt),
+                    ))
+                    .await;
+                    continue;
+                }
+                log_unsent_payload(payload, &format!("status_{status}"));
+                return format!(
+                    "Feedback could not be delivered and was logged. (Server returned {status})"
+                );
+            }
+            Err(e) => {
+                if attempt < MAX_RETRIES {
+                    eprintln!(
+                        "PatchworkMCP: delivery failed ({e}), retrying ({}/{})",
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
+                    tokio::time::sleep(Duration::from_millis(
+                        INITIAL_BACKOFF_MS * 2u64.pow(attempt),
+                    ))
+                    .await;
+                    continue;
+                }
+                eprintln!(
+                    "PatchworkMCP: could not reach API after {} attempts: {e}",
+                    MAX_RETRIES + 1
+                );
+                log_unsent_payload(payload, &format!("unreachable:{e}"));
+                return "Feedback could not be delivered and was logged. (Server unreachable)"
+                    .to_string();
+            }
+        }
+    }
+
+    log_unsent_payload(payload, "unreachable:retries_exhausted");
+    "Feedback could not be delivered and was logged. (Server unreachable)".to_string()
+}
+
+/// Build a FeedbackPayload from a JSON value (as received from MCP call_tool).
+/// Missing fields get sensible defaults. Server slug is resolved from opts/env.
+pub fn payload_from_args(args: &serde_json::Value, opts: Option<&Options>) -> FeedbackPayload {
+    let s = |key: &str| -> String {
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let tools: Vec<String> = args
+        .get("tools_available")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    FeedbackPayload {
+        server_slug: resolve_slug(opts),
+        what_i_needed: s("what_i_needed"),
+        what_i_tried: s("what_i_tried"),
+        gap_type: {
+            let g = s("gap_type");
+            if g.is_empty() {
+                "other".to_string()
+            } else {
+                g
+            }
+        },
+        suggestion: s("suggestion"),
+        user_goal: s("user_goal"),
+        resolution: s("resolution"),
+        agent_model: s("agent_model"),
+        session_id: s("session_id"),
+        client_type: s("client_type"),
+        tools_available: tools,
+    }
+}
+
+// ── JSON Schema (for manual tool registration) ──────────────────────────────
+
+/// Returns the tool input schema as a serde_json::Value. Use this when
+/// registering the tool manually with your MCP framework.
+pub fn tool_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "what_i_needed": {
+                "type": "string",
+                "description": "What capability, data, or tool were you looking for?"
+            },
+            "what_i_tried": {
+                "type": "string",
+                "description": "What tools or approaches did you try? Include tool names and brief results."
+            },
+            "gap_type": {
+                "type": "string",
+                "enum": ["missing_tool", "incomplete_results", "missing_parameter", "wrong_format", "other"],
+                "description": "The category of gap encountered."
+            },
+            "suggestion": {
+                "type": "string",
+                "description": "Your idea for what would have helped."
+            },
+            "user_goal": {
+                "type": "string",
+                "description": "The user's original request or goal."
+            },
+            "resolution": {
+                "type": "string",
+                "enum": ["blocked", "worked_around", "partial"],
+                "description": "What happened after hitting the gap."
+            },
+            "tools_available": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Tool names you considered or tried."
+            },
+            "agent_model": {
+                "type": "string",
+                "description": "Your model identifier, if known."
+            },
+            "session_id": {
+                "type": "string",
+                "description": "Conversation or session identifier."
+            },
+            "client_type": {
+                "type": "string",
+                "description": "The MCP client in use, if known (e.g. 'claude-desktop', 'cursor', 'claude-code')."
+            }
+        },
+        "required": ["what_i_needed", "what_i_tried", "gap_type"]
+    })
+}
