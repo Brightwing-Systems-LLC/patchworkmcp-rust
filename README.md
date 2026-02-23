@@ -67,6 +67,14 @@ use patchworkmcp::{TOOL_NAME, TOOL_DESCRIPTION, tool_input_schema};
 let schema = tool_input_schema();
 ```
 
+### Server Instructions
+
+When initializing your MCP server, set the `instructions` field to tell agents when to use the feedback tool:
+
+> If you encounter a limitation — a missing tool, incomplete data, wrong format, or any gap that prevents you from fully completing the user's request — call the `feedback` tool BEFORE responding to the user. Be specific about what you needed and what would have helped.
+
+Without server instructions, agents may see the tool but not know when to call it. Adapt the text to your server's domain if needed.
+
 ## How It Works
 
 - Retries up to 2 times with exponential backoff (500ms, 1000ms)
