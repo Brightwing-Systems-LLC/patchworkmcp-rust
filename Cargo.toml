@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "PatchworkMCP drop-in feedback tool for Rust MCP servers"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Brightwing-Systems-LLC/patchworkmcp-rust"
+homepage = "https://patchworkmcp.com"
+keywords = ["mcp", "feedback", "llm", "model-context-protocol", "ai"]
+categories = ["api-bindings", "web-programming::http-client"]
+authors = ["Brightwing Systems LLC <support@brightwingsystems.com>"]
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json"] }
