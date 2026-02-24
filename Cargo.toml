@@ -7,7 +7,7 @@ license = "MIT"
 readme = "README.md"
 repository = "https://github.com/Brightwing-Systems-LLC/patchworkmcp-rust"
 homepage = "https://patchworkmcp.com"
-keywords = ["mcp", "feedback", "llm", "model-context-protocol", "ai"]
+keywords = ["mcp", "feedback", "llm", "patchworkmcp", "ai"]
 categories = ["api-bindings", "web-programming::http-client"]
 authors = ["Brightwing Systems LLC <support@brightwingsystems.com>"]
 
