@@ -67,13 +67,54 @@ use patchworkmcp::{TOOL_NAME, TOOL_DESCRIPTION, tool_input_schema};
 let schema = tool_input_schema();
 ```
 
-### Server Instructions
+### Server Instructions (Critical)
 
-When initializing your MCP server, set the `instructions` field to tell agents when to use the feedback tool:
+**You must add instructions to your MCP server telling agents to use the feedback tool.** Without explicit server instructions, agents will see the feedback tool in their tool list but will almost never call it on their own. The tool description alone is not enough — agents need to be told directly, via the server's `instructions` field, that they are expected to report limitations.
 
-> If you encounter a limitation — a missing tool, incomplete data, wrong format, or any gap that prevents you from fully completing the user's request — call the `feedback` tool BEFORE responding to the user. Be specific about what you needed and what would have helped.
+This is the single most important step in integrating PatchworkMCP. If you skip it, you will receive little to no feedback, and the integration will appear broken even though everything is wired up correctly.
 
-Without server instructions, agents may see the tool but not know when to call it. Adapt the text to your server's domain if needed.
+#### Why this matters
+
+MCP servers can return an `instructions` field during initialization. This text is injected into the agent's system prompt and treated as authoritative guidance. Without it:
+
+- Agents discover the `feedback` tool but treat it as optional.
+- Most agents will not call a tool unless they are told to, even if the tool description says "call this whenever…".
+- You end up with zero feedback data, defeating the purpose of the integration.
+
+#### What to set
+
+When your MCP server handles the `initialize` request, include an `instructions` string. Use the following text as a starting point and adapt it to your server's domain:
+
+```text
+IMPORTANT: If you encounter a limitation — a missing tool, incomplete data,
+wrong format, or any gap that prevents you from fully completing the user's
+request — you MUST call the `feedback` tool BEFORE responding to the user.
+Be specific about what you needed, what you tried, and what would have helped.
+Do not skip this step. Reporting limitations is how this server improves.
+```
+
+#### Example (pseudo-code)
+
+```rust
+// When building your MCP server's initialize response:
+let instructions = concat!(
+    "IMPORTANT: If you encounter a limitation — a missing tool, incomplete data, ",
+    "wrong format, or any gap that prevents you from fully completing the user's ",
+    "request — you MUST call the `feedback` tool BEFORE responding to the user. ",
+    "Be specific about what you needed, what you tried, and what would have helped. ",
+    "Do not skip this step. Reporting limitations is how this server improves."
+);
+
+// Pass `instructions` in your server's InitializeResult.
+```
+
+#### Checklist
+
+1. Register the `feedback` tool using `TOOL_NAME`, `TOOL_DESCRIPTION`, and `tool_input_schema()`.
+2. Set the server `instructions` field with the text above (or your own variant).
+3. Verify by asking your agent to perform a task your server cannot handle — the agent should call `feedback` before responding.
+
+See [FEEDBACK_TOOL_INSTRUCTIONS.md](./FEEDBACK_TOOL_INSTRUCTIONS.md) for a detailed guide you can reference or share with your team.
 
 ## How It Works
 
