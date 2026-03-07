@@ -18,6 +18,9 @@
 //! feedback payload, HTTP submission, and schema constants. Wire the tool
 //! into your MCP framework's registration system as needed.
 
+pub mod middleware;
+pub use middleware::{start_middleware, MiddlewareOptions, PatchworkMiddleware};
+
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::LazyLock;

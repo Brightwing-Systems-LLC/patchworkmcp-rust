@@ -1,29 +1,35 @@
-# PatchworkMCP - Rust
+# PatchworkMCP - Rust SDK
 
-Drop-in feedback tool for Rust MCP servers. Agents call this tool when they hit a limitation, and the feedback is sent to PatchworkMCP for review and action.
+PatchworkMCP helps MCP server authors understand how agents actually use their servers — what works, what's missing, and what to build next. This SDK adds three things to your server:
 
-## Setup
+1. **A feedback tool** that agents call when they hit a limitation (missing tool, incomplete data, wrong format). This creates a structured stream of real-world gap reports visible on your PatchworkMCP dashboard.
+2. **Server instructions** that tell agents when and how to use the feedback tool. Without these, agents see the tool but don't know when to call it.
+3. **A heartbeat monitor** that pings PatchworkMCP every 60 seconds so you can track uptime and see which tools your server exposes.
 
-1. Go to [patchworkmcp.com](https://patchworkmcp.com) and create an account
-2. Create a team and generate an API key
-3. Configure your server (you'll need the server slug and API key)
+None of these change your server's existing behavior. They're additive — your existing tools, resources, and prompts stay exactly as they are.
 
-## Install
+> **Note:** The Rust MCP ecosystem is still maturing. This SDK provides the feedback payload, HTTP submission, schema constants, and heartbeat middleware. Wire the feedback tool into your MCP framework's registration system as needed.
+
+## Quick Start
+
+### 1. Create a PatchworkMCP account
+
+Go to [patchworkmcp.com](https://patchworkmcp.com), create a team, register your server, and generate an API key. You'll need:
+- Your **API key**
+- Your **server slug** (the identifier for your server on PatchworkMCP)
+
+### 2. Install the SDK
 
 Add to your `Cargo.toml`:
 
 ```toml
-reqwest = { version = "0.12", features = ["json"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["full"] }
+[dependencies]
+patchworkmcp = "0.1"
 ```
 
-Then copy `src/lib.rs` into your project (or add as a dependency).
+Or copy the source files into your project. Dependencies: `reqwest`, `serde`, `serde_json`, `tokio`.
 
-## Configure
-
-Set these environment variables (or pass them via Options):
+### 3. Set environment variables
 
 | Variable | Description | Required |
 |---|---|---|
@@ -31,22 +37,88 @@ Set these environment variables (or pass them via Options):
 | `PATCHWORKMCP_SERVER_SLUG` | Your server's slug from patchworkmcp.com | Yes |
 | `PATCHWORKMCP_URL` | API endpoint (default: `https://patchworkmcp.com`) | No |
 
-## Usage
+### 4. Add to your server
 
 ```rust
-use patchworkmcp::{payload_from_args, send_feedback};
+use patchworkmcp::{
+    TOOL_NAME, TOOL_DESCRIPTION, tool_input_schema,
+    payload_from_args, send_feedback,
+    start_middleware, MiddlewareOptions,
+};
 
-// Build payload from MCP call_tool arguments:
-let payload = payload_from_args(&args, None);
+// -- Server instructions --
+// This is what tells agents to use the feedback tool. Without it,
+// agents may see the tool but won't know when to call it.
+let instructions = "If you encounter a limitation — a missing tool, incomplete data, \
+    wrong format, or any gap that prevents you from fully completing the user's \
+    request — call the `feedback` tool BEFORE responding to the user. Be specific \
+    about what you needed and what would have helped.";
 
-// Send feedback:
-let message = send_feedback(&payload, None).await;
+// -- Feedback tool --
+// Register with your MCP framework using these constants:
+let schema = tool_input_schema();
+// TOOL_NAME = "feedback"
+// TOOL_DESCRIPTION = "Report when you cannot find what you need..."
+
+// In your tool handler:
+// let payload = payload_from_args(&args, None);
+// let message = send_feedback(&payload, None).await;
+
+// -- Heartbeat monitor --
+// Sends a ping every 60s with your server slug and tool list.
+let mw = start_middleware(MiddlewareOptions {
+    patchwork_url: None,
+    api_key: None,
+    server_slug: None,
+    tool_names: vec!["my_tool_1".to_string(), "my_tool_2".to_string()],
+});
+
+// To stop later: mw.stop()
 ```
 
-### With options
+## What Each Piece Does
+
+### Feedback Tool
+
+When an agent can't find the right tool, gets incomplete results, or has to work around a limitation, it calls the `feedback` tool with structured data:
+
+- **what_i_needed** — the capability or data it was looking for
+- **what_i_tried** — which tools it tried and what happened
+- **gap_type** — category: `missing_tool`, `incomplete_results`, `missing_parameter`, `wrong_format`, `other`
+- **suggestion** — the agent's idea for what would help
+
+These reports appear on your PatchworkMCP dashboard, giving you a prioritized list of what to build next based on real agent usage.
+
+### Server Instructions (Critical)
+
+**You must add instructions to your MCP server telling the agent to use the feedback tool.** This is the single most important step in the integration. Without explicit instructions, agents will silently ignore the feedback tool — even though it appears in their tool list.
+
+The `instructions` field on your MCP server is what makes the feedback tool useful. It tells agents: "if you hit a wall, report it before responding." Key principles:
+
+1. **Tell the agent it is required.** Agents treat server instructions as authoritative. If you don't say "you must call the feedback tool," they won't.
+2. **Specify when to call it.** List the concrete scenarios: missing tool, incomplete results, wrong format, about to say "not possible."
+3. **Say to call it BEFORE responding.** If the agent responds first, it rarely circles back to submit feedback.
+4. **Ask for specifics.** Generic feedback like "something was missing" is not actionable.
+
+Without instructions, PatchworkMCP receives zero signal about what your server is missing. **No instructions = no feedback.**
+
+For the full guide on writing effective agent instructions, see [FEEDBACK_TOOL_INSTRUCTIONS.md](FEEDBACK_TOOL_INSTRUCTIONS.md).
+
+### Heartbeat Monitor
+
+The middleware sends a heartbeat to PatchworkMCP every 60 seconds containing:
+- Your server slug
+- How many tools your server exposes
+- The list of tool names
+
+This powers uptime monitoring on your dashboard and lets PatchworkMCP track which tools are live.
+
+## Alternative Integration Patterns
+
+### Override configuration
 
 ```rust
-use patchworkmcp::{Options, payload_from_args, send_feedback};
+use patchworkmcp::{Options, MiddlewareOptions, payload_from_args, send_feedback, start_middleware};
 
 let opts = Options {
     patchwork_url: Some("https://custom.example.com".to_string()),
@@ -56,73 +128,23 @@ let opts = Options {
 
 let payload = payload_from_args(&args, Some(&opts));
 let message = send_feedback(&payload, Some(&opts)).await;
+
+let mw = start_middleware(MiddlewareOptions {
+    patchwork_url: Some("https://custom.example.com".to_string()),
+    api_key: Some("my-key".to_string()),
+    server_slug: Some("my-server".to_string()),
+    tool_names: vec!["my_tool_1".to_string()],
+});
 ```
 
-### Tool registration
+## Reliability
 
-```rust
-use patchworkmcp::{TOOL_NAME, TOOL_DESCRIPTION, tool_input_schema};
-
-// Register with your MCP framework:
-let schema = tool_input_schema();
-```
-
-### Server Instructions (Critical)
-
-**You must add instructions to your MCP server telling agents to use the feedback tool.** Without explicit server instructions, agents will see the feedback tool in their tool list but will almost never call it on their own. The tool description alone is not enough — agents need to be told directly, via the server's `instructions` field, that they are expected to report limitations.
-
-This is the single most important step in integrating PatchworkMCP. If you skip it, you will receive little to no feedback, and the integration will appear broken even though everything is wired up correctly.
-
-#### Why this matters
-
-MCP servers can return an `instructions` field during initialization. This text is injected into the agent's system prompt and treated as authoritative guidance. Without it:
-
-- Agents discover the `feedback` tool but treat it as optional.
-- Most agents will not call a tool unless they are told to, even if the tool description says "call this whenever…".
-- You end up with zero feedback data, defeating the purpose of the integration.
-
-#### What to set
-
-When your MCP server handles the `initialize` request, include an `instructions` string. Use the following text as a starting point and adapt it to your server's domain:
-
-```text
-IMPORTANT: If you encounter a limitation — a missing tool, incomplete data,
-wrong format, or any gap that prevents you from fully completing the user's
-request — you MUST call the `feedback` tool BEFORE responding to the user.
-Be specific about what you needed, what you tried, and what would have helped.
-Do not skip this step. Reporting limitations is how this server improves.
-```
-
-#### Example (pseudo-code)
-
-```rust
-// When building your MCP server's initialize response:
-let instructions = concat!(
-    "IMPORTANT: If you encounter a limitation — a missing tool, incomplete data, ",
-    "wrong format, or any gap that prevents you from fully completing the user's ",
-    "request — you MUST call the `feedback` tool BEFORE responding to the user. ",
-    "Be specific about what you needed, what you tried, and what would have helped. ",
-    "Do not skip this step. Reporting limitations is how this server improves."
-);
-
-// Pass `instructions` in your server's InitializeResult.
-```
-
-#### Checklist
-
-1. Register the `feedback` tool using `TOOL_NAME`, `TOOL_DESCRIPTION`, and `tool_input_schema()`.
-2. Set the server `instructions` field with the text above (or your own variant).
-3. Verify by asking your agent to perform a task your server cannot handle — the agent should call `feedback` before responding.
-
-See [FEEDBACK_TOOL_INSTRUCTIONS.md](./FEEDBACK_TOOL_INSTRUCTIONS.md) for a detailed guide you can reference or share with your team.
-
-## How It Works
-
-- Retries up to 2 times with exponential backoff (500ms, 1000ms)
+- Feedback submissions retry up to 2 times with exponential backoff (500ms, 1000ms)
 - Retries on 429 (rate limit) and 5xx (server error) status codes
 - Uses a static `reqwest::Client` for connection pooling and TLS session reuse
 - On failure, logs the full payload with `PATCHWORKMCP_UNSENT_FEEDBACK` prefix for later replay
 - Never panics — always returns a user-facing message
+- Heartbeats are fire-and-forget; failures are logged but don't affect your server
 
 ## License
 
